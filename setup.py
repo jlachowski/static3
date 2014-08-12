@@ -1,4 +1,12 @@
 """
+Copyright (C) 2014 Jaroslaw Lachowski <jalachowski@gmail.com>
+
+based on
+https://github.com/rmohr/static3
+https://github.com/erfaan/static
+
+"""
+"""
 Copyright (C) 2013 Roman Mohr <roman@fenkhuber.at>
 """
 
@@ -31,11 +39,12 @@ from setuptools import setup
 from setuptools.command.test import test as TestCommand
 import sys
 
+
 class PyTest(TestCommand):
 
     def finalize_options(self):
         TestCommand.finalize_options(self)
-        self.test_args = ['--cov', 'static' , 'tests']
+        self.test_args = ['--cov', 'static', 'tests']
         self.test_suite = True
 
     def run_tests(self):
@@ -45,14 +54,14 @@ class PyTest(TestCommand):
         sys.exit(errno)
 
 
-setup(name='static3',
-      version='0.5.1',
+setup(name='static3-jl',
+      version='0.6.0',
       description=
       'A really simple WSGI way to serve static (or mixed) content.',
       long_description=open('README.rst').read(),
-      author='Roman Mohr',
-      author_email='roman@fenkhuber.at',
-      url='https://github.com/rmohr/static3',
+      author='Jaroslaw Lachowski',
+      author_email='jalachowski@gmail.com',
+      url='https://github.com/jlachowski/static3',
       license="LGPL",
       py_modules=['static'],
       packages=[],
