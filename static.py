@@ -29,12 +29,13 @@ Boston, MA  02110-1301, USA.
 Luke Arno can be found at http://lukearno.com/
 
 """
-
+import fnmatch
 import mimetypes
 import email.utils as rfc822
 import time
 import string
 import sys
+import re
 from os import path, stat
 from wsgiref import util
 from wsgiref.headers import Headers
@@ -94,25 +95,49 @@ def _open(filename, encoding):
 
 
 class StatusApp:
-
     """Used by WSGI apps to return some HTTP status."""
 
-    def __init__(self, status, message=None, encoding=sys.getdefaultencoding()):
+    block_size = 16 * 4096
+
+    def __init__(
+        self, status, message=None, encoding=sys.getdefaultencoding(),
+        file=None
+    ):
         self.status = status
         self.encoding = encoding
+        self.file = file
         if message is None:
             self.message = status
         else:
             self.message = message
 
     def __call__(self, environ, start_response, headers=[]):
-        if self.message:
+        if self.file:
+            content_type = self._guess_type(self.file)
+            Headers(headers).add_header('Content-type', content_type)
+
+            file_like = self._file_like(self.file)
+            self.message = self._body(environ, file_like)
+        elif self.message:
             Headers(headers).add_header('Content-type', 'text/plain')
         start_response(self.status, headers)
         if environ['REQUEST_METHOD'] == 'HEAD':
             return [_encode("", self.econding)]
         else:
-            return [_encode(self.message, self.encoding)]
+            return self.message
+
+    def _file_like(self, full_path):
+        """Return the appropriate file object."""
+        return open(full_path, 'rb')
+
+    def _guess_type(self, full_path):
+        """Guess the mime type using the mimetypes module."""
+        return mimetypes.guess_type(full_path)[0] or 'text/plain'
+
+    def _body(self, environ, file_like):
+        """Return an iterator over the body of the response."""
+        way_to_send = environ.get('wsgi.file_wrapper', iter_and_close)
+        return way_to_send(file_like, self.block_size)
 
 
 class Cling(object):
@@ -133,6 +158,27 @@ class Cling(object):
     not_modified = StatusApp('304 Not Modified', "")
     moved_permanently = StatusApp('301 Moved Permanently')
     method_not_allowed = StatusApp('405 Method Not Allowed')
+    gzip_mime_types = [
+        "application/atom+xml",
+        "application/javascript",
+        "application/json",
+        "application/rss+xml",
+        "application/vnd.ms-fontobject",
+        "application/x-font-ttf",
+        "application/xhtml+xml",
+        "application/xml",
+        "font/opentype",
+        "image/svg+xml",
+        "image/x-icon",
+        "text/css",
+        "text/html",
+        "text/plain",
+        "text/x-component",
+        "text/xml"
+    ]
+    expire_headers = []
+    charsets = []  # No default charset
+    custom_headers = []
 
     def __init__(self, root, **kw):
         """Just set the root and any other attribs passes via **kw."""
@@ -161,11 +207,25 @@ class Cling(object):
             else:
                 full_path = self._full_path(path_info + self.index_file)
         content_type = self._guess_type(full_path)
+        headers = []
         try:
+            # Vary: Accept-Encoding should be there irrespective of
+            # we are serving gzipped content or not
+            if self._should_gzip(full_path, content_type):
+                headers.append(('Vary', 'Accept-Encoding'))
+                if self._gzip_response(full_path, environ, content_type):
+                    full_path = full_path + ".gz"
+                    headers.append(("Content-Encoding", "gzip"))
             etag, last_modified = self._conditions(full_path, environ)
-            headers = [('Date', rfc822.formatdate(time.time())),
-                       ('Last-Modified', last_modified),
-                       ('ETag', etag)]
+            headers.append(('Date', rfc822.formatdate(time.time())))
+            headers.append(('Last-Modified', last_modified))
+            headers.append(('ETag', etag))
+            for mimetype, seconds in self.expire_headers:
+                if content_type == mimetype:
+                    headers.append(
+                        ('Expires', rfc822.formatdate(time.time() + seconds)))
+                    headers.append(("Cache-Control", "max-age=" + str(seconds)))
+
             if_modified = environ.get('HTTP_IF_MODIFIED_SINCE')
             if if_modified and (rfc822.parsedate(if_modified)
                                 >= rfc822.parsedate(last_modified)):
@@ -173,8 +233,22 @@ class Cling(object):
             if_none = environ.get('HTTP_IF_NONE_MATCH')
             if if_none and (if_none == '*' or etag in if_none):
                 return self.not_modified(environ, start_response, headers)
-            file_like = self._file_like(full_path)
+
+            charset = None
+            for fnpattern, _charset in self.charsets:
+                if fnmatch.fnmatch(full_path, fnpattern) or \
+                        fnmatch.fnmatch(full_path, fnpattern + ".gz"):
+                    charset = _charset
+            if charset:
+                content_type = "%s; charset=%s" % (content_type, charset)
             headers.append(('Content-Type', content_type))
+
+            for fnpattern, header_k, header_v in self.custom_headers:
+                if fnmatch.fnmatch(full_path, fnpattern) or \
+                        fnmatch.fnmatch(full_path, fnpattern + ".gz"):
+                    headers.append((header_k, header_v))
+
+            file_like = self._file_like(full_path)
             start_response("200 OK", headers)
             if environ['REQUEST_METHOD'] == 'GET':
                 return self._body(full_path, environ, file_like)
@@ -215,6 +289,34 @@ class Cling(object):
         way_to_send = environ.get('wsgi.file_wrapper', iter_and_close)
         return way_to_send(file_like, self.block_size)
 
+    def _gzip_response(self, full_path, environ, content_type):
+        """Returns whether the file should be gzipped or not"""
+        # Do not gzip content from IE5-6 without SP2
+        # http://sebduggan.com/blog/ie6-gzip-bug-solved-using-isapirewrite/
+        user_agent = environ.get('HTTP_USER_AGENT', '')
+        if re.search("MSIE\ [56]", user_agent) and not re.search("SV1", user_agent):
+            return False
+        # Push beyond gzipping
+        # http://developer.yahoo.com/blogs/ydn/posts/2010/12/pushing-beyond-gzipping/
+        re_k = '^(HTTP_Accept_EncodXng|HTTP_X_cept_Encoding|HTTP_X{15}|HTTP_~{15}|HTTP_{16})$'
+        re_v = '^((gzip|deflate)\s*,?\s*)+|[X~-]{4,13}$'
+        have_accept_encoding = False
+        for k, v in environ.iteritems():
+            if re.match(re_k, k, flags=re.IGNORECASE) and re.match(re_v, v, flags=re.IGNORECASE):
+                have_accept_encoding = True
+        if have_accept_encoding:
+            environ['HTTP_ACCEPT_ENCODING'] = "gzip,deflate"
+        if not re.search("gzip", environ.get('HTTP_ACCEPT_ENCODING', ''), flags=re.IGNORECASE):
+            return False
+        return self._should_gzip(full_path, content_type)
+
+    def _should_gzip(self, full_path, content_type):
+        if not path.exists(full_path + ".gz"):
+            return False
+        if content_type in self.gzip_mime_types:
+            return True
+        return False
+
 
 def iter_and_close(file_like, block_size):
     """Yield file contents by block then close the file."""
@@ -225,7 +327,7 @@ def iter_and_close(file_like, block_size):
                 yield block
             else:
                 raise StopIteration
-        except StopIteration as si:
+        except StopIteration:
             file_like.close()
             return
 
@@ -321,8 +423,10 @@ class Shock(Cling):
         """Return an iterator over the body of the response."""
         magic = self._match_magic(full_path)
         if magic is not None:
-            return [_encode(s,self.encoding) for s in magic.body(environ,
-                file_like)]
+            return [
+                _encode(s, self.encoding) for s in magic.body(
+                    environ, file_like)
+            ]
         else:
             way_to_send = environ.get('wsgi.file_wrapper', iter_and_close)
             return way_to_send(file_like, self.block_size)
@@ -469,7 +573,7 @@ def command():
         app = Cling(args[0])
         try:
             make_server(host, port, app).serve_forever()
-        except KeyboardInterrupt as ki:
+        except KeyboardInterrupt:
             print("Cio, baby!")
         except:
             sys.exit("Problem initializing server.")
@@ -485,7 +589,7 @@ def test():
     app = Shock('testdata/pub', magics=magics)
     try:
         make_server('localhost', 9999, validator(app)).serve_forever()
-    except KeyboardInterrupt as ki:
+    except KeyboardInterrupt:
         print("Ciao, baby!")
 
 
